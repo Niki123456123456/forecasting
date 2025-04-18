@@ -1,6 +1,7 @@
 use egui::Ui;
 use egui_plot::Legend;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     let mut native_options = eframe::NativeOptions::default();
     native_options.viewport =
@@ -11,6 +12,64 @@ fn main() {
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
     .unwrap();
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    use eframe::wasm_bindgen::JsCast as _;
+
+    let web_options = eframe::WebOptions::default();
+
+    wasm_bindgen_futures::spawn_local(async {
+        let document = web_sys::window()
+            .expect("No window")
+            .document()
+            .expect("No document");
+
+        let canvas = document
+            .get_element_by_id("the_canvas_id")
+            .expect("Failed to find the_canvas_id")
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .expect("the_canvas_id was not a HtmlCanvasElement");
+
+        let start_result = eframe::WebRunner::new()
+            .start(
+                canvas,
+                web_options,
+                Box::new(|cc| Ok(Box::new(App::new(cc)))),
+            )
+            .await;
+
+        // Remove the loading text and spinner:
+        if let Some(loading_text) = document.get_element_by_id("loading_text") {
+            match start_result {
+                Ok(_) => {
+                    loading_text.remove();
+                }
+                Err(e) => {
+                    loading_text.set_inner_html(
+                        "<p> The app has crashed. See the developer console for details. </p>",
+                    );
+                    panic!("Failed to start eframe: {e:?}");
+                }
+            }
+        }
+    });
+}
+
+
+pub struct DemandSource {
+    pub name: String,
+    pub demand: Vec<f64>,
+}
+
+impl DemandSource {
+    pub fn new(name: impl Into<String>, demand: Vec<f64>) -> Self {
+        Self {
+            name: name.into(),
+            demand,
+        }
+    }
 }
 
 pub struct ForecastMethod {
@@ -190,19 +249,18 @@ impl Default for ForecastParameters {
 pub struct App {
     parameters: ForecastParameters,
     forecasts: Vec<ForecastMethod>,
-    demand: Vec<f64>,
+    sources: Vec<DemandSource>,
+    source_id: usize,
+    show_err: bool,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let parameters = ForecastParameters::default();
-        let sales: Vec<f64> = vec![
-            266.0, 145.9, 183.1, 119.3, 180.3, 168.5, 231.8, 224.5, 192.8, 122.9, 336.5, 185.9,
-            194.3, 149.5, 210.1, 273.3, 191.4, 287.0, 226.0, 303.6, 289.9, 421.6, 264.5, 342.3,
-            339.7, 440.4, 315.9, 439.3, 401.3, 437.4, 575.5, 407.6, 682.0, 475.3, 581.3, 646.9,
-        ];
 
-        let mut sales: Vec<f64> = vec![
+        let mut sources = vec![];
+
+        let mut unemployed: Vec<f64> = vec![
             2_967_080.0,
             2_989_220.0,
             2_992_660.0,
@@ -420,21 +478,37 @@ impl App {
             3_795_940.0,
         ];
 
-        sales.reverse();
+        unemployed.reverse();
 
-        // let sales: Vec<f64> = vec![
-        //     14., 10., 6., 2., 18., 8., 4., 1., 16., 9., 5., 3., 18., 11., 4., 2., 17., 9., 5., 1.,
-        // ];
+        sources.push(DemandSource::new("unemployed", unemployed.to_vec()));
 
-        let mut demand = sales.to_vec();
-        demand.extend(vec![f64::NAN; parameters.extra_periods]);
+        sources.push(DemandSource::new(
+            "shampoo",
+            vec![
+                266.0, 145.9, 183.1, 119.3, 180.3, 168.5, 231.8, 224.5, 192.8, 122.9, 336.5, 185.9,
+                194.3, 149.5, 210.1, 273.3, 191.4, 287.0, 226.0, 303.6, 289.9, 421.6, 264.5, 342.3,
+                339.7, 440.4, 315.9, 439.3, 401.3, 437.4, 575.5, 407.6, 682.0, 475.3, 581.3, 646.9,
+            ],
+        ));
 
-        let forecasts = methods(&demand, &parameters);
+        sources.push(DemandSource::new(
+            "season test",
+            vec![
+                14., 10., 6., 2., 18., 8., 4., 1., 16., 9., 5., 3., 18., 11., 4., 2., 17., 9., 5.,
+                1.,
+            ],
+        ));
+
+        
+
+        let forecasts = methods(&sources[0].demand, &parameters);
 
         return App {
-            demand,
+            sources,
             parameters,
             forecasts,
+            show_err: false,
+            source_id: 0,
         };
     }
 }
@@ -464,8 +538,6 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     let mut changed = false;
-                    let extra_periods = self.parameters.extra_periods;
-
                     changed |= slider_u(ui, &mut self.parameters.extra_periods, "extra periods");
                     changed |= slider_u(ui, &mut self.parameters.season_len, "season length");
                     changed |= slider_u(ui, &mut self.parameters.n, "n");
@@ -474,15 +546,24 @@ impl eframe::App for App {
                     changed |= slider_f(ui, &mut self.parameters.phi, "phi");
                     changed |= slider_f(ui, &mut self.parameters.gamma, "gamma");
 
+                    ui.checkbox(&mut self.show_err, "show err");
+
+                    egui::ComboBox::from_label("demand source")
+                        .selected_text(self.sources[self.source_id].name.clone())
+                        .show_ui(ui, |ui| {
+                            for (i, source) in self.sources.iter().enumerate() {
+                                let mut i_temp = self.source_id;
+                                ui.selectable_value(&mut i_temp, i, source.name.clone());
+                                if i_temp != self.source_id {
+                                    self.source_id = i_temp;
+                                    changed = true;
+                                }
+                            }
+                        });
+
                     if changed {
-                        let diff = extra_periods as i32 - self.parameters.extra_periods as i32;
-                        if diff > 0 {
-                            self.demand.extend(vec![f64::NAN; diff as usize]);
-                        } else {
-                            self.demand.truncate(self.demand.len() - (-diff as usize));
-                        }
                         for m in self.forecasts.iter_mut() {
-                            m.update(&self.demand, &self.parameters);
+                            m.update(&self.sources[self.source_id].demand, &self.parameters);
                         }
                     }
                 });
@@ -508,27 +589,28 @@ impl eframe::App for App {
                 .show(ui, |plot_ui| {
                     plot_ui.line(egui_plot::Line::new(
                         "demand",
-                        egui_plot::PlotPoints::from_ys_f64(
-                            &self.demand[..&self.demand.len() - self.parameters.extra_periods],
-                        ),
+                        egui_plot::PlotPoints::from_ys_f64(&self.sources[self.source_id].demand),
                     ));
                     for forcast in self.forecasts.iter() {
-                        plot_ui.line(egui_plot::Line::new(
-                            forcast.name,
-                            forcast.result.forecast[1..]
-                                .iter()
-                                .enumerate()
-                                .map(|(i, &y)| [i as f64 + 1., y])
-                                .collect::<egui_plot::PlotPoints>(),
-                        ));
-                        plot_ui.line(egui_plot::Line::new(
-                            format!("{} err", forcast.name),
-                            forcast.result.err[1..]
-                                .iter()
-                                .enumerate()
-                                .map(|(i, &y)| [i as f64 + 1., y])
-                                .collect::<egui_plot::PlotPoints>(),
-                        ));
+                        if self.show_err {
+                            plot_ui.line(egui_plot::Line::new(
+                                format!("{} err", forcast.name),
+                                forcast.result.err[1..]
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, &y)| [i as f64 + 1., y])
+                                    .collect::<egui_plot::PlotPoints>(),
+                            ));
+                        } else {
+                            plot_ui.line(egui_plot::Line::new(
+                                forcast.name,
+                                forcast.result.forecast[1..]
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, &y)| [i as f64 + 1., y])
+                                    .collect::<egui_plot::PlotPoints>(),
+                            ));
+                        }
                     }
                 });
         });
@@ -536,16 +618,14 @@ impl eframe::App for App {
 }
 
 fn moving_average(demand: &[f64], extra_periods: usize, n: usize) -> Vec<f64> {
-    let cols = demand.len() - extra_periods;
+    let mut forecast = vec![f64::NAN; demand.len() + extra_periods];
 
-    let mut forecast = vec![f64::NAN; demand.len()];
-
-    for i in n..cols {
+    for i in n..demand.len() {
         forecast[i] = mean(&demand[i - n..i]);
     }
 
-    let avg = mean(&demand[cols - n..cols]);
-    for i in cols..demand.len() {
+    let avg = mean(&demand[demand.len() - n..]);
+    for i in demand.len()..demand.len() + extra_periods {
         forecast[i] = avg;
     }
 
@@ -557,17 +637,15 @@ fn lin_smooth(alpha: f64, a: f64, b: f64) -> f64 {
 }
 
 fn exp_smooth(demand: &[f64], extra_periods: usize, alpha: f64) -> Vec<f64> {
-    let cols = demand.len() - extra_periods;
-
-    let mut forecast = vec![f64::NAN; demand.len()];
+    let mut forecast = vec![f64::NAN; demand.len() + extra_periods];
 
     forecast[1] = demand[0];
 
-    for i in 2..cols + 1 {
+    for i in 2..demand.len() + 1 {
         forecast[i] = lin_smooth(alpha, demand[i - 1], forecast[i - 1]);
     }
 
-    for i in cols + 1..demand.len() {
+    for i in demand.len() + 1..demand.len() + extra_periods {
         forecast[i] = forecast[i - 1];
     }
 
@@ -575,21 +653,19 @@ fn exp_smooth(demand: &[f64], extra_periods: usize, alpha: f64) -> Vec<f64> {
 }
 
 fn double_exp_smooth(demand: &[f64], extra_periods: usize, alpha: f64, beta: f64) -> Vec<f64> {
-    let cols = demand.len() - extra_periods;
-
-    let mut forecast = vec![f64::NAN; demand.len()];
+    let mut forecast = vec![f64::NAN; demand.len() + extra_periods];
 
     let mut a = demand[0];
     let mut b = demand[1] - demand[0];
 
-    for i in 1..cols {
+    for i in 1..demand.len() {
         forecast[i] = a + b;
         let a_new = lin_smooth(alpha, demand[i], a + b);
         b = lin_smooth(beta, a_new - a, b);
         a = a_new;
     }
 
-    for i in cols..demand.len() {
+    for i in demand.len()..demand.len() + extra_periods {
         forecast[i] = a + b;
         a = forecast[i];
         b = b;
@@ -605,21 +681,19 @@ fn double_exp_smooth_damped(
     beta: f64,
     phi: f64,
 ) -> Vec<f64> {
-    let cols = demand.len() - extra_periods;
-
-    let mut forecast = vec![f64::NAN; demand.len()];
+    let mut forecast = vec![f64::NAN; demand.len() + extra_periods];
 
     let mut a = demand[0];
     let mut b = demand[1] - demand[0];
 
-    for i in 1..cols {
+    for i in 1..demand.len() {
         forecast[i] = a + phi * b;
         let a_new = lin_smooth(alpha, demand[i], a + phi * b);
         b = lin_smooth(beta, a_new - a, phi * b);
         a = a_new;
     }
 
-    for i in cols..demand.len() {
+    for i in demand.len()..demand.len() + extra_periods {
         forecast[i] = a + phi * b;
         a = forecast[i];
         b = phi * b;
@@ -637,12 +711,9 @@ fn triple_exp_smooth(
     phi: f64,
     gamma: f64,
 ) -> Vec<f64> {
-    let cols = demand.len() - extra_periods;
+    let mut forecast = vec![f64::NAN; demand.len() + extra_periods];
 
-    let mut forecast = vec![f64::NAN; demand.len()];
-
-    let mut seasonal_factors =
-        seasonal_factors(&demand[..demand.len() - extra_periods], season_len);
+    let mut seasonal_factors = seasonal_factors(&demand, season_len);
 
     let mut a = demand[0] / seasonal_factors[0];
     let seasonal_factor1 = if seasonal_factors.len() > 1 {
@@ -659,7 +730,7 @@ fn triple_exp_smooth(
         a = a_new;
     }
 
-    for i in season_len..cols {
+    for i in season_len..demand.len() {
         let last_s = seasonal_factors[i % season_len];
 
         forecast[i] = (a + phi * b) * last_s;
@@ -669,7 +740,7 @@ fn triple_exp_smooth(
         a = a_new;
     }
 
-    for i in cols..demand.len() {
+    for i in demand.len()..demand.len() + extra_periods {
         let last_s = seasonal_factors[i % season_len];
 
         forecast[i] = (a + phi * b) * last_s;
